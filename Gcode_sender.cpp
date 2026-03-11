@@ -1,120 +1,99 @@
 
+#ifndef UPLOADER_HPP
+#define UPLOADER_HPP
+
 #include <iostream>
-#include <fstream>
 #include <string>
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
+#include <vector>
 
-using namespace std;
+class Uploader {
+private:
+    int fd = -1;
 
-bool configureSerial(int fd, speed_t baudrate = B115200) {
-    struct termios tty;
-    if (tcgetattr(fd, &tty) != 0) {
-        perror("tcgetattr");
-        return false;
+public:
+    // 1. Открываем порт ОДИН РАЗ
+    bool connect(const std::string& device) {
+        fd = open(device.c_str(), O_RDWR | O_NOCTTY | O_SYNC);
+        if (fd < 0) return false;
+
+        struct termios tty;
+        if (tcgetattr(fd, &tty) != 0) return false;
+
+        cfsetospeed(&tty, B115200);
+        cfsetispeed(&tty, B115200);
+
+        tty.c_cflag |= (CLOCAL | CREAD);
+        tty.c_cflag &= ~PARENB;
+        tty.c_cflag &= ~CSTOPB;
+        tty.c_cflag &= ~CSIZE;
+        tty.c_cflag |= CS8;
+        tty.c_lflag = 0;
+        tty.c_oflag = 0;
+        tty.c_cc[VMIN] = 0;
+        tty.c_cc[VTIME] = 10; // 1 сек таймаут
+
+        if (tcsetattr(fd, TCSANOW, &tty) != 0) return false;
+
+        sleep(2);
+        tcflush(fd, TCIOFLUSH);
+        return true;
     }
 
-    cfsetospeed(&tty, baudrate);
-    cfsetispeed(&tty, baudrate);
+    // 2. Универсальный метод отправки (не закрывает порт)
+    bool send(std::string command) {
+        if (fd < 0) return false;
+        if (command.back() != '\n') command += "\n";
 
-    tty.c_cflag &= ~PARENB;     // No parity
-    tty.c_cflag &= ~CSTOPB;     // 1 stop bit
-    tty.c_cflag &= ~CSIZE;
-    tty.c_cflag |= CS8;         // 8 bits
-    tty.c_cflag &= ~CRTSCTS;    // No flow control
-    tty.c_cflag |= CREAD | CLOCAL; // enable receiver, local mode
+        if (write(fd, command.c_str(), command.size()) < 0) return false;
 
-    tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG); // raw input
-    tty.c_iflag &= ~(IXON | IXOFF | IXANY); // turn off s/w flow ctrl
-    tty.c_oflag &= ~OPOST; // raw output
-
-    // Set read timeout
-    tty.c_cc[VMIN] = 0;
-    tty.c_cc[VTIME] = 20; // 2 seconds read timeout
-
-    if (tcsetattr(fd, TCSANOW, &tty) != 0) {
-        perror("tcsetattr");
-        return false;
-    }
-
-    return true;
-}
-
-int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        cerr << "Usage: " << argv[0] << " <gcode_file> <serial_device>" << endl;
-        return 1;
-    }
-
-    const char* filename = argv[1];
-    const char* serialPort = argv[2];
-
-    ifstream file(filename);
-    if (!file.is_open()) {
-        cerr << "Error opening file: " << filename << endl;
-        return 2;
-    }
-
-    int fd = open(serialPort, O_RDWR | O_NOCTTY | O_SYNC);
-    if (fd < 0) {
-        perror("Error opening serial port");
-        return 3;
-    }
-
-    if (!configureSerial(fd)) {
-        close(fd);
-        return 4;
-    }
-
-    // Даем Arduino время перезагрузиться после открытия порта (обычно)
-    sleep(2);
-
-    string line;
-    char buf[256];
-    ssize_t n;
-
-    while (getline(file, line)) {
-        // Игнорируем пустые строки и комментарии (начинаются с ';')
-        if (line.empty() || line[0] == ';')
-            continue;
-
-        line += "\n";
-        ssize_t to_write = line.size();
-        const char* data = line.c_str();
-
-        // Отправляем команду
-        ssize_t written = write(fd, data, to_write);
-        if (written != to_write) {
-            cerr << "Error writing to serial port" << endl;
-            break;
-        }
-
-        // Читаем ответ, ожидаем строку с "ok" или ошибку
-        string response;
-        while (true) {
-            n = read(fd, buf, sizeof(buf) - 1);
-            if (n < 0) {
-                perror("read");
-                break;
-            } else if (n == 0) {
-                // Таймаут, выходим из цикла чтения, возможно ошибка ответа
-                break;
-            } else {
+        // Читаем ответ пока не увидим "ok" или "error"
+        std::string response;
+        char buf[128];
+        int attempts = 0;
+        while (attempts < 20) {
+            int n = read(fd, buf, sizeof(buf) - 1);
+            if (n > 0) {
                 buf[n] = '\0';
                 response += buf;
-                // Проверяем, пришёл ли полный ответ с "ok" или "error"
-                if (response.find("ok") != string::npos || response.find("error") != string::npos)
-                    break;
+                if (response.find("ok") != std::string::npos) return true;
+                if (response.find("error") != std::string::npos) {
+                    std::cerr << "GRBL Error: " << response << std::endl;
+                    return false;
+                }
             }
+            usleep(50000); // 50мс
+            attempts++;
         }
-
-        cout << "Sent: " << line;
-        cout << "Response: " << response << endl;
+        return false;
     }
 
-    close(fd);
-    file.close();
+    bool waitForIdle() {
+        char buf[128];
+        while (true) {
+            // Отправляем символ '?' (запрос статуса)
+            write(fd, "?", 1);
 
-    return 0;
-}
+            std::string status;
+            usleep(100000); // Пауза 100мс, чтобы не спамить
+
+            int n = read(fd, buf, sizeof(buf) - 1);
+            if (n > 0) {
+                buf[n] = '\0';
+                status = buf;
+                // Если в ответе есть "Idle", значит станок закончил движение
+                if (status.find("Idle") != std::string::npos) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    ~Uploader() {
+        if (fd >= 0) close(fd);
+    }
+};
+
+#endif
